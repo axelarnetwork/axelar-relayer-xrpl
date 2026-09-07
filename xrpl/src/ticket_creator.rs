@@ -8,7 +8,7 @@ use relayer_base::gmp_api::{
     GmpApiTrait,
 };
 use relayer_base::utils::ThreadSafe;
-use xrpl_multisig_prover;
+use xrpl_multisig_prover::error::ContractError;
 
 pub struct XrplTicketCreator<G: GmpApiTrait + ThreadSafe> {
     gmp_api: Arc<G>,
@@ -49,7 +49,7 @@ where
         match query_res {
             Err(e)
                 if e.to_string()
-                    .contains("ticket count threshold has not been reached") =>
+                    .contains(&ContractError::TicketCountThresholdNotReached.to_string()) =>
             {
                 debug!("Ticket count threshold has not been reached. Skipping ticket create.");
                 tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
@@ -91,7 +91,7 @@ where
         let mut sleep_duration = 5;
         if let Err(e) = res {
             if e.to_string()
-                .contains("ticket count threshold has not been reached")
+                .contains(&ContractError::TicketCountThresholdNotReached.to_string())
             {
                 debug!("Ticket count threshold has not been reached. Ignoring.");
             } else {
