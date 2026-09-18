@@ -12,6 +12,7 @@ use serde_json::Value;
 use tracing::{debug, error, info, level_filters::LevelFilter, warn, Level};
 use tracing_subscriber::{fmt, prelude::*, Registry};
 use xrpl_amplifier_types::{
+    error::XRPLError,
     msg::XRPLMessage,
     types::{XRPLPaymentAmount, XRPLToken, XRPLTokenAmount},
 };
@@ -153,6 +154,70 @@ pub fn event_attribute(event: &WasmEvent, key: &str) -> Option<String> {
         .map(|e| e.value.clone())
 }
 
+/// Parses an XRPL issued-token amount, short-circuiting values that canonicalize to zero.
+///
+/// `XRPLTokenAmount::from_str` canonicalizes by multiplying the mantissa by ten until it
+/// reaches MIN_MANTISSA or the exponent bottoms out at MIN_EXPONENT (-96). A zero mantissa
+/// never grows, so `0e9223372036854775807` spins for ~9.2e18 iterations before returning
+/// (0, 1) -- the value every zero canonicalizes to. Gas fee amounts come from an
+/// attacker-controlled memo, so the input is guarded here.
+///
+/// Upstream fixed this in xrpl-types as of xrpl-handler-v0.1.8; this helper can go once the
+/// XRPL contracts are rebased onto that lineage and we can take the newer package.
+pub fn parse_xrpl_token_amount(value: &str) -> Result<XRPLTokenAmount, XRPLError> {
+    if canonicalizes_to_zero(value) {
+        return Ok(XRPLTokenAmount::new(0, 1));
+    }
+    XRPLTokenAmount::from_str(value)
+}
+
+/// Whether `value` is a zero that `XRPLTokenAmount::from_str` would accept.
+///
+/// This mirrors every check `from_str` makes before canonicalization -- exponent split,
+/// exponent parsing, empty base, the `exponent - decimal_offset` subtraction, and the digits
+/// `Uint256` will accept. Anything not matched here is handed to `from_str`, which rejects it
+/// before reaching the slow path, so the two agree on every input.
+fn canonicalizes_to_zero(value: &str) -> bool {
+    let (base, exponent) = match value.find(['e', 'E']) {
+        None => (value, 0i64),
+        Some(loc) => match value[loc.saturating_add(1)..].parse::<i64>() {
+            Ok(exponent) => (&value[..loc], exponent),
+            Err(_) => return false,
+        },
+    };
+
+    if base.is_empty() {
+        return false;
+    }
+
+    // from_str ignores `_` only when counting fractional digits; `Uint256` then rejects it.
+    let decimal_offset = match base.find('.') {
+        None => 0i64,
+        Some(loc) => base[loc.saturating_add(1)..]
+            .chars()
+            .filter(|c| *c != '_')
+            .count() as i64,
+    };
+
+    if exponent.checked_sub(decimal_offset).is_none() {
+        return false;
+    }
+
+    let digits = base.strip_prefix('+').unwrap_or(base);
+    let mut saw_digit = false;
+    let mut saw_point = false;
+    for c in digits.chars() {
+        match c {
+            '0' => saw_digit = true,
+            // from_str removes only the first point, so a second one reaches `Uint256` and is
+            // rejected there; defer rather than call such input zero.
+            '.' if !saw_point => saw_point = true,
+            _ => return false,
+        }
+    }
+    saw_digit
+}
+
 pub fn parse_gas_fee_amount(
     payment_amount: &XRPLPaymentAmount,
     gas_fee_amount: String,
@@ -163,7 +228,7 @@ pub fn parse_gas_fee_amount(
                 issuer: token.issuer,
                 currency: token.currency,
             },
-            gas_fee_amount.try_into().map_err(|_| {
+            parse_xrpl_token_amount(&gas_fee_amount).map_err(|_| {
                 IngestorError::GenericError(
                     "Failed to parse gas fee amount as XRPLTokenAmount".to_owned(),
                 )
@@ -209,7 +274,7 @@ pub fn parse_payment_amount(
                     )
                 })?,
             },
-            XRPLTokenAmount::from_str(&issued_amount.value).map_err(|_| {
+            parse_xrpl_token_amount(&issued_amount.value).map_err(|_| {
                 IngestorError::GenericError("Failed to parse amount as XRPLTokenAmount".to_owned())
             })?,
         ))
@@ -805,6 +870,103 @@ mod tests {
         assert!(
             err.is_err(),
             "Expected error parsing invalid issued gas fee amount"
+        );
+    }
+
+    #[test]
+    fn test_parse_xrpl_token_amount_zero_significand_terminates() {
+        // A zero significand with a huge exponent used to drive canonicalize_mantissa through
+        // ~9.2e18 iterations. Every zero canonicalizes to (0, 1), so short-circuit to it.
+        for value in [
+            "0",
+            "0.0",
+            "0e9223372036854775807",
+            "0.0e9223372036854775807",
+            "0.000e80",
+        ] {
+            assert_eq!(
+                parse_xrpl_token_amount(value).unwrap(),
+                XRPLTokenAmount::new(0, 1),
+                "unexpected result for {}",
+                value
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_xrpl_token_amount_agrees_with_from_str() {
+        // Every input here terminates under `from_str`, so the guard must not change the
+        // outcome -- neither accepting what it rejects, nor the reverse.
+        for value in [
+            // valid, non-zero
+            "100.0",
+            "123.456",
+            "1e81",
+            "0.000001",
+            "1e-96",
+            // zeros that from_str accepts (slowly, but within bounds here)
+            "0",
+            "00",
+            "0.0",
+            "0.",
+            ".0",
+            "+0",
+            "0e80",
+            "0e-96",
+            "0E5",
+            // malformed: the guard must defer to from_str rather than call these zero
+            "-0",
+            "-1.0",
+            "0_0",
+            "0.0_0",
+            "1_000",
+            "0e1e2",
+            "0e99999999999999999999",
+            "0.0e-9223372036854775808",
+            "e5",
+            "",
+            "0.0.0",
+            "0..0",
+            ".",
+            "0.0.0e5",
+            "+0.0",
+            "0+0",
+            " 0",
+            "invalid_amount",
+            "0x0",
+        ] {
+            let guarded = parse_xrpl_token_amount(value);
+            let direct = XRPLTokenAmount::from_str(value);
+            assert_eq!(
+                guarded.is_err(),
+                direct.is_err(),
+                "acceptance differs for {:?}: guarded={:?} direct={:?}",
+                value,
+                guarded.is_ok(),
+                direct.is_ok()
+            );
+            if let (Ok(guarded), Ok(direct)) = (guarded, direct) {
+                assert_eq!(guarded, direct, "value differs for {:?}", value);
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_gas_fee_amount_zero_significand_terminates() {
+        let token = XRPLToken {
+            issuer: XRPLAccountId::from_str("rPT1Sjq2YGrBMTttX4GZHjKu9dyfzbpAYe").unwrap(),
+            currency: XRPLCurrency::new("USD").unwrap(),
+        };
+        let payment_amount =
+            XRPLPaymentAmount::Issued(token.clone(), XRPLTokenAmount::from_str("100.0").unwrap());
+
+        // Reaches XRPLTokenAmount parsing straight from an attacker-controlled memo.
+        let gas_fee_amount =
+            parse_gas_fee_amount(&payment_amount, "0e9223372036854775807".to_string())
+                .expect("zero gas fee amount parses");
+        assert_eq!(
+            gas_fee_amount,
+            XRPLPaymentAmount::Issued(token, XRPLTokenAmount::new(0, 1))
         );
     }
 
