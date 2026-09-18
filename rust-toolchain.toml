@@ -1,0 +1,7 @@
+# Pinned to match the Docker builder image (Dockerfile.xrpl: rust:1.86-bookworm).
+# Newer toolchains (>= ~1.90) fail to compile the `size-of` crate pulled in via
+# axelar-amplifier -> starknet-types-core: error[E0570] "fastcall" is not a
+# supported ABI for the current target.
+[toolchain]
+channel = "1.86.0"
+components = ["rustfmt", "clippy"]
