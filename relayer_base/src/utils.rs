@@ -16,7 +16,7 @@ use xrpl_amplifier_types::{
     msg::XRPLMessage,
     types::{XRPLPaymentAmount, XRPLToken, XRPLTokenAmount},
 };
-use xrpl_api::{Memo, PaymentTransaction, Transaction, TxRequest};
+use xrpl_api::{Memo, PaymentTransaction, ResultCategory, Transaction, TxRequest};
 
 use crate::{
     config::Config,
@@ -283,6 +283,46 @@ pub fn parse_payment_amount(
             "Payment amount must be either Drops or Issued".to_owned(),
         ));
     }
+}
+
+/// Sanity checks for a user payment to the multisig, mirroring the checks performed by the XRPL
+/// verifiers (ampd). A payment that fails these checks can never reach quorum, so the relayer must
+/// not derive any event from it.
+///
+/// See <https://xrpl.org/docs/concepts/payment-types/partial-payments#partial-payments-exploit>
+pub fn validate_user_payment(payment: &PaymentTransaction) -> Result<(), IngestorError> {
+    if !payment.flags.is_empty() {
+        return Err(IngestorError::UnsupportedTransaction(format!(
+            "payment has flags set: {:?}",
+            payment.flags
+        )));
+    }
+
+    if payment.common.validated != Some(true) {
+        return Err(IngestorError::UnsupportedTransaction(
+            "payment is not from a validated ledger".to_owned(),
+        ));
+    }
+
+    let meta = payment.common.meta.as_ref().ok_or_else(|| {
+        IngestorError::UnsupportedTransaction("payment is missing metadata".to_owned())
+    })?;
+
+    if meta.transaction_result.category() != ResultCategory::Tes {
+        return Err(IngestorError::UnsupportedTransaction(format!(
+            "payment was not successful: {:?}",
+            meta.transaction_result
+        )));
+    }
+
+    if meta.delivered_amount.as_ref() != Some(&payment.amount) {
+        return Err(IngestorError::UnsupportedTransaction(format!(
+            "delivered amount {:?} does not match payment amount {:?}",
+            meta.delivered_amount, payment.amount
+        )));
+    }
+
+    Ok(())
 }
 
 // Should this be moved to the xrpl client?
@@ -1013,6 +1053,119 @@ mod tests {
             .unwrap()
             .to_string()
             .contains("Invalid UTF-8"));
+    }
+
+    fn valid_user_payment(amount: xrpl_api::Amount) -> PaymentTransaction {
+        PaymentTransaction {
+            amount: amount.clone(),
+            common: xrpl_api::TransactionCommon {
+                validated: Some(true),
+                meta: Some(xrpl_api::Meta {
+                    affected_nodes: vec![],
+                    transaction_index: 0,
+                    transaction_result: xrpl_api::TransactionResult::tesSUCCESS,
+                    delivered_amount: Some(amount),
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_validate_user_payment_ok() {
+        let payment = valid_user_payment(xrpl_api::Amount::Drops("100".to_string()));
+        assert!(validate_user_payment(&payment).is_ok());
+
+        let payment = valid_user_payment(xrpl_api::Amount::Issued(IssuedAmount {
+            value: "100".to_string(),
+            currency: "USD".to_string(),
+            issuer: "rPT1Sjq2YGrBMTttX4GZHjKu9dyfzbpAYe".to_string(),
+        }));
+        assert!(validate_user_payment(&payment).is_ok());
+    }
+
+    #[test]
+    fn test_validate_user_payment_rejects_flags() {
+        let mut payment = valid_user_payment(xrpl_api::Amount::Drops("100".to_string()));
+        payment.flags = xrpl_types::PaymentFlags::PartialPayment.into();
+        assert!(matches!(
+            validate_user_payment(&payment),
+            Err(IngestorError::UnsupportedTransaction(msg)) if msg.contains("flags")
+        ));
+
+        // any flag is rejected, not just tfPartialPayment
+        let mut payment = valid_user_payment(xrpl_api::Amount::Drops("100".to_string()));
+        payment.flags = xrpl_types::PaymentFlags::NoDirectRipple.into();
+        assert!(validate_user_payment(&payment).is_err());
+    }
+
+    #[test]
+    fn test_validate_user_payment_rejects_partial_delivery() {
+        // tfPartialPayment is checked separately; this guards the delivered amount on its own
+        let mut payment = valid_user_payment(xrpl_api::Amount::Drops("100000000".to_string()));
+        payment.common.meta.as_mut().unwrap().delivered_amount =
+            Some(xrpl_api::Amount::Drops("1".to_string()));
+        assert!(matches!(
+            validate_user_payment(&payment),
+            Err(IngestorError::UnsupportedTransaction(msg)) if msg.contains("delivered amount")
+        ));
+
+        let mut payment = valid_user_payment(xrpl_api::Amount::Issued(IssuedAmount {
+            value: "100".to_string(),
+            currency: "USD".to_string(),
+            issuer: "rPT1Sjq2YGrBMTttX4GZHjKu9dyfzbpAYe".to_string(),
+        }));
+        payment.common.meta.as_mut().unwrap().delivered_amount =
+            Some(xrpl_api::Amount::Issued(IssuedAmount {
+                value: "0.0001".to_string(),
+                currency: "USD".to_string(),
+                issuer: "rPT1Sjq2YGrBMTttX4GZHjKu9dyfzbpAYe".to_string(),
+            }));
+        assert!(validate_user_payment(&payment).is_err());
+
+        // delivered in a different asset than requested
+        let mut payment = valid_user_payment(xrpl_api::Amount::Drops("100".to_string()));
+        payment.common.meta.as_mut().unwrap().delivered_amount =
+            Some(xrpl_api::Amount::Issued(IssuedAmount {
+                value: "100".to_string(),
+                currency: "USD".to_string(),
+                issuer: "rPT1Sjq2YGrBMTttX4GZHjKu9dyfzbpAYe".to_string(),
+            }));
+        assert!(validate_user_payment(&payment).is_err());
+    }
+
+    #[test]
+    fn test_validate_user_payment_rejects_missing_meta() {
+        let mut payment = valid_user_payment(xrpl_api::Amount::Drops("100".to_string()));
+        payment.common.meta = None;
+        assert!(matches!(
+            validate_user_payment(&payment),
+            Err(IngestorError::UnsupportedTransaction(msg)) if msg.contains("metadata")
+        ));
+
+        let mut payment = valid_user_payment(xrpl_api::Amount::Drops("100".to_string()));
+        payment.common.meta.as_mut().unwrap().delivered_amount = None;
+        assert!(validate_user_payment(&payment).is_err());
+    }
+
+    #[test]
+    fn test_validate_user_payment_rejects_failed_or_unvalidated() {
+        let mut payment = valid_user_payment(xrpl_api::Amount::Drops("100".to_string()));
+        payment.common.meta.as_mut().unwrap().transaction_result =
+            xrpl_api::TransactionResult::tecPATH_PARTIAL;
+        assert!(matches!(
+            validate_user_payment(&payment),
+            Err(IngestorError::UnsupportedTransaction(msg)) if msg.contains("not successful")
+        ));
+
+        let mut payment = valid_user_payment(xrpl_api::Amount::Drops("100".to_string()));
+        payment.common.validated = Some(false);
+        assert!(validate_user_payment(&payment).is_err());
+
+        let mut payment = valid_user_payment(xrpl_api::Amount::Drops("100".to_string()));
+        payment.common.validated = None;
+        assert!(validate_user_payment(&payment).is_err());
     }
 
     #[test]

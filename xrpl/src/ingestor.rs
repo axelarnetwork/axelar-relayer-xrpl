@@ -26,7 +26,7 @@ use relayer_base::{
     utils::{
         convert_token_amount_to_drops, event_attribute, extract_and_decode_memo,
         extract_hex_xrpl_memo, parse_gas_fee_amount, parse_message_from_context,
-        parse_payment_amount, xrpl_tx_from_hash,
+        parse_payment_amount, validate_user_payment, xrpl_tx_from_hash,
     },
 };
 use router_api::{ChainNameRaw, CrossChainId};
@@ -91,6 +91,17 @@ where
         &self,
         payment: PaymentTransaction,
     ) -> Result<Vec<Event>, IngestorError> {
+        // Mirror the verifiers' checks (flags, delivered amount, success) before deriving any
+        // event
+        if let Err(e) = validate_user_payment(&payment) {
+            warn!(
+                "Skipping invalid payment {}: {}",
+                payment.common.hash.as_deref().unwrap_or("<no hash>"),
+                e
+            );
+            return Ok(vec![]);
+        }
+
         match self.build_xrpl_message(&payment).await {
             Ok(message_with_payload) => match &message_with_payload.message {
                 XRPLMessage::InterchainTransferMessage(_) | XRPLMessage::CallContractMessage(_) => {

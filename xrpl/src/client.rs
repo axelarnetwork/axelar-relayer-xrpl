@@ -4,8 +4,8 @@ use anyhow::anyhow;
 use serde::{de::DeserializeOwned, Serialize};
 use tracing::{debug, info};
 use xrpl_api::{
-    LedgerIndex, LedgerObject, ObjectType, Request, RequestPagination, RetrieveLedgerSpec, Ticket,
-    Transaction,
+    AccountTransaction, LedgerIndex, LedgerObject, ObjectType, Request, RequestPagination,
+    RetrieveLedgerSpec, Ticket, Transaction,
 };
 use xrpl_types::AccountId;
 
@@ -136,7 +136,7 @@ impl XRPLClientTrait for XRPLClient {
             let response = res.map_err(|e| anyhow!("Error getting txs: {:?}", e.to_string()))?;
 
             // Add transactions from this page to our collection
-            all_transactions.extend(response.transactions.iter().map(|tx| tx.tx.clone()));
+            all_transactions.extend(response.transactions.iter().map(with_account_tx_metadata));
 
             // Check if there are more pages
             marker = response.pagination.marker;
@@ -180,5 +180,68 @@ impl XRPLClientTrait for XRPLClient {
             })
             .collect();
         Ok(tickets)
+    }
+}
+
+/// Transactions returned by `account_tx` carry their metadata and validation flag next to the
+/// transaction object instead of inside it (unlike `tx` responses). Fold them into the transaction
+/// so downstream consumers can rely on `common().meta` (e.g. `delivered_amount`) and
+/// `common().validated` regardless of how the transaction was fetched.
+fn with_account_tx_metadata(account_tx: &AccountTransaction) -> Transaction {
+    let mut tx = account_tx.tx.clone();
+    let common = tx.common_mut();
+    if common.meta.is_none() {
+        common.meta = Some(account_tx.meta.clone());
+    }
+    if common.validated.is_none() {
+        common.validated = Some(account_tx.validated);
+    }
+    tx
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use xrpl_api::{Amount, Meta, PaymentTransaction, TransactionResult};
+
+    fn meta(delivered: &str) -> Meta {
+        Meta {
+            affected_nodes: vec![],
+            transaction_index: 0,
+            transaction_result: TransactionResult::tesSUCCESS,
+            delivered_amount: Some(Amount::Drops(delivered.to_string())),
+        }
+    }
+
+    #[test]
+    fn test_with_account_tx_metadata_attaches_meta_and_validated() {
+        let account_tx = AccountTransaction {
+            meta: meta("42"),
+            tx: Transaction::Payment(PaymentTransaction {
+                amount: Amount::Drops("42".to_string()),
+                ..Default::default()
+            }),
+            validated: true,
+        };
+
+        let tx = with_account_tx_metadata(&account_tx);
+        assert_eq!(tx.common().meta, Some(meta("42")));
+        assert_eq!(tx.common().validated, Some(true));
+    }
+
+    #[test]
+    fn test_with_account_tx_metadata_keeps_existing_values() {
+        let mut payment = PaymentTransaction::default();
+        payment.common.meta = Some(meta("1"));
+        payment.common.validated = Some(false);
+        let account_tx = AccountTransaction {
+            meta: meta("2"),
+            tx: Transaction::Payment(payment),
+            validated: true,
+        };
+
+        let tx = with_account_tx_metadata(&account_tx);
+        assert_eq!(tx.common().meta, Some(meta("1")));
+        assert_eq!(tx.common().validated, Some(false));
     }
 }
