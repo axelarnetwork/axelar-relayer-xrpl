@@ -4,7 +4,7 @@ Decorator pattern for the GMP API that adds database auditing.
 The `GmpApiDbAuditDecorator` wraps a GMP API implementation and adds database logging.
 
 * get_tasks_action spawns a new tokio task to insert the task into the database, so the DB write can be lost
-* post_events awaits for the event to be written to the database, but spawns the new task to write the response.
+* post_events awaits for the event to be written to the database, but spawns a new task to write a successful response. An error response is awaited, so it is not lost.
 * cannot_execute_message is a bit of a special case, since it doesn't accept or return any events. We should avoid constructing events in the GMP API class and this function should be deprecated.
 
 The idea is that when posting_events, we want them in the database for inspection in case they never reach GMP API.
@@ -166,18 +166,18 @@ where
             }
             Err(err) => {
                 let error_message = format!("{err}");
-                let error_result = PostEventResult {
-                    status: "error".to_string(),
-                    index: 0,
-                    error: Some(error_message.clone()),
-                    retriable: None,
-                };
                 let gmp_events = Arc::clone(&self.gmp_events);
                 // We do not spawn a task here, because it's quite important that we save the error.
-                for event_model in event_models.iter() {
+                for (index, event_model) in event_models.iter().enumerate() {
+                    let error_result = PostEventResult {
+                        status: "error".to_string(),
+                        index,
+                        error: Some(error_message.clone()),
+                        retriable: None,
+                    };
                     let event_id = event_model.event_id.clone();
                     if let Err(e) = gmp_events
-                        .update_event_response(event_id, Json(error_result.clone()))
+                        .update_event_response(event_id, Json(error_result))
                         .await
                     {
                         error!("Failed to update error response in database: e={e:?}, event_model={event_model:?}");
@@ -461,6 +461,7 @@ mod tests {
 
         mock_gmp_events
             .expect_update_event_response()
+            .times(1)
             .returning(|event_id, response| Box::pin(async move {
                 assert_eq!(event_id, "event123");
                 assert_eq!(response.encode_to_string().unwrap(), "{\"status\":\"error\",\"index\":0,\"error\":\"GMP API Request failed: API error\",\"retriable\":null}");
